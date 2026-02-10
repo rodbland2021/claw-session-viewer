@@ -31,7 +31,38 @@ HTML_TEMPLATE = """
             padding: 20px;
         }
         .container { max-width: 1400px; margin: 0 auto; }
-        h1 { color: #58a6ff; margin-bottom: 20px; }
+        h1 { color: #58a6ff; margin-bottom: 10px; }
+        
+        .toolbar {
+            display: flex;
+            gap: 12px;
+            align-items: center;
+            margin-bottom: 15px;
+            padding: 10px 14px;
+            background: #161b22;
+            border: 1px solid #30363d;
+            border-radius: 8px;
+            font-size: 13px;
+            flex-wrap: wrap;
+        }
+        .toolbar label {
+            display: flex;
+            align-items: center;
+            gap: 5px;
+            cursor: pointer;
+            user-select: none;
+        }
+        .toolbar input[type="checkbox"] { accent-color: #58a6ff; }
+        .toolbar .separator {
+            width: 1px;
+            height: 20px;
+            background: #30363d;
+        }
+        .session-count {
+            color: #8b949e;
+            font-size: 12px;
+            margin-left: auto;
+        }
         
         .sessions-grid {
             display: grid;
@@ -233,6 +264,15 @@ HTML_TEMPLATE = """
     <div class="container">
         <h1>🔍 Session Viewer</h1>
         
+        <div class="toolbar">
+            <label><input type="checkbox" id="show-cron" onchange="loadSessions()"> Show Cron Jobs</label>
+            <label><input type="checkbox" id="filter-empty" onchange="loadSessions()"> Hide Empty</label>
+            <div class="separator"></div>
+            <label><input type="checkbox" id="filter-main" onchange="loadSessions()"> Main Only</label>
+            <label><input type="checkbox" id="filter-discord" onchange="loadSessions()"> Discord Only</label>
+            <span class="session-count" id="session-count"></span>
+        </div>
+        
         <div class="sessions-grid" id="sessions"></div>
         
         <div class="transcript-viewer" id="transcript-viewer" style="display: none;">
@@ -247,6 +287,10 @@ HTML_TEMPLATE = """
                 </div>
             </div>
             <div class="transcript-content" id="transcript"></div>
+            <div id="load-more-wrap" style="display:none; text-align:center; padding:15px;">
+                <button class="btn" id="btn-load-more" onclick="loadMore()" style="padding:10px 24px;">Load More</button>
+                <span id="pagination-info" style="margin-left:10px; font-size:12px; color:#8b949e;"></span>
+            </div>
         </div>
     </div>
     
@@ -256,6 +300,7 @@ HTML_TEMPLATE = """
         let selectedSession = null;
         let tailInterval = null;
         let lastEntryCount = 0;
+        let allSessions = [];
         
         function formatBytes(bytes) {
             if (bytes < 1024) return bytes + ' B';
@@ -291,9 +336,34 @@ HTML_TEMPLATE = """
             }
         }
         
+        function isCronSession(s) {
+            const key = (s.key || '').toLowerCase();
+            const name = (s.displayName || '').toLowerCase();
+            return key.includes(':cron:') || name.includes('cron:');
+        }
+        
+        function filterSessions(sessions) {
+            const hideCron = !document.getElementById('show-cron').checked;
+            const hideEmpty = document.getElementById('filter-empty').checked;
+            const mainOnly = document.getElementById('filter-main').checked;
+            const discordOnly = document.getElementById('filter-discord').checked;
+            
+            return sessions.filter(s => {
+                if (hideCron && isCronSession(s)) return false;
+                if (hideEmpty && (!s.totalTokens || s.totalTokens === 0)) return false;
+                if (mainOnly && !s.key.startsWith('agent:main:main')) return false;
+                if (discordOnly && !s.key.includes('discord:')) return false;
+                return true;
+            });
+        }
+        
         async function loadSessions() {
             const res = await fetch('/api/sessions');
-            const sessions = await res.json();
+            allSessions = await res.json();
+            
+            const sessions = filterSessions(allSessions);
+            document.getElementById('session-count').textContent = 
+                `${sessions.length} of ${allSessions.length} sessions`;
             
             const container = document.getElementById('sessions');
             container.innerHTML = sessions.map(s => {
@@ -333,15 +403,29 @@ HTML_TEMPLATE = """
             refreshTranscript();
         }
         
+        let currentOffset = 0;
+        const PAGE_SIZE = 100;
+        
         async function refreshTranscript() {
             if (!selectedSession) return;
+            currentOffset = 0;
             
             const showTools = document.getElementById('show-tools').checked;
-            const res = await fetch(`/api/transcript?key=${encodeURIComponent(selectedSession)}&tools=${showTools}`);
+            const res = await fetch(`/api/transcript?key=${encodeURIComponent(selectedSession)}&tools=${showTools}&limit=${PAGE_SIZE}&offset=0`);
             const data = await res.json();
             
             document.getElementById('transcript-title').textContent = 
-                `${data.displayName || selectedSession} — ${data.entries.length} entries`;
+                `${data.displayName || selectedSession} — ${data.total} entries`;
+            
+            const wrap = document.getElementById('load-more-wrap');
+            if (data.hasMore) {
+                wrap.style.display = 'block';
+                document.getElementById('pagination-info').textContent = 
+                    `Showing ${Math.min(PAGE_SIZE, data.total)} of ${data.total}`;
+            } else {
+                wrap.style.display = 'none';
+            }
+            currentOffset = PAGE_SIZE;
             
             const container = document.getElementById('transcript');
             container.innerHTML = data.entries.map((e, i) => {
@@ -385,6 +469,44 @@ HTML_TEMPLATE = """
             return div.innerHTML;
         }
         
+        async function loadMore() {
+            if (!selectedSession) return;
+            const showTools = document.getElementById('show-tools').checked;
+            const res = await fetch(`/api/transcript?key=${encodeURIComponent(selectedSession)}&tools=${showTools}&limit=${PAGE_SIZE}&offset=${currentOffset}`);
+            const data = await res.json();
+            
+            currentOffset += PAGE_SIZE;
+            
+            const container = document.getElementById('transcript');
+            const html = data.entries.map((e, i) => {
+                const sizeClass = getSizeClass(e.chars);
+                let content = e.content;
+                if (content.length > 2000) content = content.substring(0, 2000);
+                content = content.replace(/\[Image: [^\]]+\]/g, '<div class="image-placeholder">📷 [Image data]</div>');
+                return `
+                    <div class="entry ${e.role}">
+                        <div class="entry-header">
+                            <div class="entry-meta">
+                                <span class="entry-role ${e.role}">${e.role}${e.toolName ? ': ' + e.toolName : ''}</span>
+                                <span class="entry-timestamp">${formatTimestamp(e.timestamp)}</span>
+                            </div>
+                            <span class="entry-size ${sizeClass}">${formatBytes(e.chars)} / ~${formatTokens(e.estimatedTokens)} tokens</span>
+                        </div>
+                        <div class="entry-content ${content.length >= 2000 ? 'truncated' : ''}">${escapeHtml(content)}</div>
+                    </div>
+                `;
+            }).join('');
+            container.insertAdjacentHTML('beforeend', html);
+            
+            const wrap = document.getElementById('load-more-wrap');
+            if (data.hasMore) {
+                document.getElementById('pagination-info').textContent = 
+                    `Showing ${currentOffset} of ${data.total}`;
+            } else {
+                wrap.style.display = 'none';
+            }
+        }
+        
         function toggleTail() {
             const btn = document.getElementById('btn-tail');
             if (tailInterval) {
@@ -404,9 +526,17 @@ HTML_TEMPLATE = """
             setTimeout(() => indicator.classList.remove('visible'), 1000);
         }
         
+        // Restore filter prefs from localStorage
+        ['show-cron','filter-empty','filter-main','filter-discord'].forEach(id => {
+            const el = document.getElementById(id);
+            const saved = localStorage.getItem('sv_' + id);
+            if (saved === 'true') el.checked = true;
+            el.addEventListener('change', () => localStorage.setItem('sv_' + id, el.checked));
+        });
+        
         // Initial load
         loadSessions();
-        setInterval(loadSessions, 5000);
+        setInterval(loadSessions, 10000);
     </script>
 </body>
 </html>
@@ -457,6 +587,8 @@ def api_sessions():
 def api_transcript():
     key = request.args.get('key', '')
     show_tools = request.args.get('tools', 'true') == 'true'
+    limit = int(request.args.get('limit', '200'))
+    offset = int(request.args.get('offset', '0'))
     
     # Find the session
     session_file = None
@@ -571,10 +703,17 @@ def api_transcript():
     
     # Reverse so latest entries appear first
     entries.reverse()
+    
+    total = len(entries)
+    entries = entries[offset:offset + limit]
 
     return jsonify({
         'entries': entries,
-        'displayName': display_name
+        'displayName': display_name,
+        'total': total,
+        'offset': offset,
+        'limit': limit,
+        'hasMore': (offset + limit) < total
     })
 
 if __name__ == '__main__':
